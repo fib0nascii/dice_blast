@@ -1,10 +1,10 @@
 use io::Error;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use thirtyfour::error::WebDriverError;
 use thirtyfour::error::WebDriverErrorInfo;
 use thirtyfour::prelude::*;
 use serde::{Deserialize, Serialize};
-use serde_json::{from_reader, Value};
+use serde_json::{from_reader, json, Value};
 use serde_urlencoded;
 use std::path::Path;
 use std::fs::File;
@@ -18,7 +18,11 @@ use regex::Regex;
 use tokio::time;
 use tokio::time::{Duration, Instant};
 use anyhow::{bail, Context};
+use base64::{encode_config};
+use base64::URL_SAFE;
+use url::Url;
 use thirtyfour::support::sleep;
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 struct Cookie {
@@ -216,27 +220,24 @@ async fn get_job_detail_ids(driver: &WebDriver, page_number: usize) -> WebDriver
     println!("Found {} <div> elements", div_elements.len());
 
     let mut jobs = Vec::new();
+    let mut seen_ids = HashSet::new();
     let hash_pattern = Regex::new(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$").unwrap();
 
     for div in div_elements {
         let a_elements = div.find_all(By::Css("a")).await?;
         for a in a_elements {
-            if let Ok(data_cy) = a.attr("data-cy").await {
-                if let Some(data_cy_value) = data_cy {
-                    if data_cy_value == "card-title-link" {
-                        if let Ok(id) = a.attr("id").await {
-                            if let Some(id_value) = id {
-                                if hash_pattern.is_match(&id_value) {
-                                    if let Ok(title) = a.text().await {
-                                        let job = Job {
-                                            page_number,
-                                            job_title: title,
-                                            url: format!("https://dice.com/job-detail/{}", id_value),
-                                        };
-                                        jobs.push(job);
-                                    }
-                                }
-                            }
+            if let Ok(id) = a.attr("id").await {
+                if let Some(id_value) = id {
+                    if hash_pattern.is_match(&id_value) && !seen_ids.contains(&id_value) {
+                        if let Ok(title) = a.text().await {
+                            println!("Job Title: {}, Job ID: {}", title, id_value);
+                            let job = Job {
+                                page_number,
+                                job_title: title,
+                                url: format!("https://dice.com/job-detail/{}", id_value),
+                            };
+                            jobs.push(job);
+                            seen_ids.insert(id_value);
                         }
                     }
                 }
@@ -246,6 +247,83 @@ async fn get_job_detail_ids(driver: &WebDriver, page_number: usize) -> WebDriver
 
     Ok(jobs)
 }
+
+async fn wait_for_element_clickable(driver: &WebDriver, selector: By, timeout: Duration) -> WebDriverResult<()> {
+    let start = tokio::time::Instant::now();
+    loop {
+        if tokio::time::Instant::now() - start > timeout {
+            return Err(WebDriverError::Timeout("Timeout waiting for element to be clickable".into()));
+        }
+        if let Ok(element) = driver.find(selector.clone()).await {
+            if element.is_displayed().await? && element.is_enabled().await? {
+                return Ok(());
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn click_easy_apply_button(driver: &WebDriver) -> WebDriverResult<()> {
+    let timeout = Duration::from_secs(30);
+    let start = tokio::time::Instant::now();
+    loop {
+        if tokio::time::Instant::now() - start > timeout {
+            return Err(WebDriverError::Timeout("Timeout waiting for Easy apply button".into()));
+        }
+        if let Ok(main_element) = driver.find(By::Css("main.flex.flex-col")).await {
+            println!("Found main element");
+            let div_elements = main_element.find_all(By::Css("div")).await?;
+            for div in div_elements {
+                if let Ok(id) = div.attr("id").await {
+                    if let Some(id_value) = id {
+                        println!("Found div with id: {}", id_value);
+                        if id_value == "applyButton" {
+                            println!("Found applyButton div");
+                            let button_elements = div.find_all(By::Css("button")).await?;
+                            println!("Found {} button elements", button_elements.len());
+                            for button in button_elements {
+                                if let Ok(class) = button.attr("class").await {
+                                    if let Some(class_value) = class {
+                                        println!("Button class: {}", class_value);
+                                        if class_value.contains("btn btn-primary") {
+                                            if let Ok(text) = button.text().await {
+                                                if text == "Easy apply" {
+                                                    println!("Found Easy apply button");
+                                                    // Scroll the button into view
+                                                    button.scroll_into_view().await?;
+                                                    // Add a small delay to ensure the button is fully interactable
+                                                    sleep(Duration::from_millis(500)).await;
+                                                    button.click().await?;
+                                                    return Ok(());
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            // Stop the loop once we find the applyButton div
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+
+
+// async fn open_job_urls(driver: &WebDriver, jobs: Vec<Job>) -> WebDriverResult<()> {
+//     for job in jobs {
+//         println!("Opening job URL: {}", job.url);
+//         driver.get(&job.url).await?;
+//         // Click the "Easy apply" button
+//         click_easy_apply_button(driver).await?;
+//         sleep(Duration::from_secs(2)).await; // Wait for 2 seconds before opening the next URL
+//     }
+//     Ok(())
+// }
 
 async fn get_element_attributes(driver: &WebDriver, element: &WebElement) -> WebDriverResult<HashMap<String, String>> {
     let mut attributes = HashMap::new();
@@ -269,6 +347,41 @@ async fn get_element_attributes(driver: &WebDriver, element: &WebElement) -> Web
     Ok(attributes)
 }
 
+fn generate_encoded_url(job_id: &str, job_title: &str, search_params: &str) -> String {
+    let data = json!({
+        "djvVersion": "new",
+        "jobId": job_id,
+        "jobUrl": format!("https://www.dice.com/job-detail/{}?{}", job_id, search_params),
+        "jobTitle": job_title,
+        "searchLink": format!("?searchlink=search%2F%3F{}", search_params),
+        "searchParams": format!("?{}", search_params)
+    });
+    let json_data = serde_json::to_string(&data).unwrap();
+    let encoded_data = encode_config(json_data, URL_SAFE);
+    format!("https://www.dice.com/apply?{}", encoded_data)
+}
+
+async fn open_job_urls(driver: &WebDriver, jobs: Vec<Job>, search_params: &str) -> WebDriverResult<()> {
+    for job in jobs {
+        println!("Opening job URL: {}", job.url);
+        let encoded_url = generate_encoded_url(&job.url, &job.job_title, search_params);
+        println!("Navigating to encoded URL: {}", encoded_url);
+        driver.get(&encoded_url).await?;
+        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds before opening the next URL
+
+        // Click the "Easy Apply" button using JavaScript
+        let script = r#"
+            var button = document.querySelector('button.btn.btn-primary');
+            if (button && button.innerText === 'Easy apply') {
+                button.click();
+            }
+        "#;
+        driver.execute_script(script, vec![]).await?;
+        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds after clicking the button
+    }
+    Ok(())
+}
+
 #[tokio::main]
 async fn main() -> WebDriverResult<()> {
     let caps = DesiredCapabilities::chrome();
@@ -282,12 +395,12 @@ async fn main() -> WebDriverResult<()> {
             load_cookies(&driver).await?;
             driver.get(&url).await?;
             let jobs = get_job_detail_ids(&driver, 1).await?;
+            open_job_urls(&driver, jobs, "").await?;
 
             println!("Press Enter to exit...");
             let _ = io::stdout().flush();
             let _ = io::stdin().read_line(&mut String::new());
 
-            println!("{:?}", jobs);
             Ok(())
         }
         Ok(false) => {
@@ -296,12 +409,12 @@ async fn main() -> WebDriverResult<()> {
                     save_cookies(&driver).await?;
                     driver.get(&url).await?;
                     let jobs = get_job_detail_ids(&driver, 1).await?;
+                    open_job_urls(&driver, jobs, "").await?;
 
                     println!("Press Enter to exit...");
                     let _ = io::stdout().flush();
                     let _ = io::stdin().read_line(&mut String::new());
 
-                    println!("{:?}", jobs);
                     Ok(())
                 }
                 Err(e) => {
