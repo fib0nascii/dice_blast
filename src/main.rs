@@ -15,14 +15,10 @@ use std::io;
 use std::fmt;
 use std::fmt::Display;
 use regex::Regex;
-use tokio::time;
-use tokio::time::{Duration, Instant};
-use anyhow::{bail, Context};
+use tokio::time::{Duration};
 use base64::{encode_config};
 use base64::URL_SAFE;
-use url::Url;
 use thirtyfour::support::sleep;
-use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 struct Cookie {
@@ -248,105 +244,6 @@ async fn get_job_detail_ids(driver: &WebDriver, page_number: usize) -> WebDriver
     Ok(jobs)
 }
 
-async fn wait_for_element_clickable(driver: &WebDriver, selector: By, timeout: Duration) -> WebDriverResult<()> {
-    let start = tokio::time::Instant::now();
-    loop {
-        if tokio::time::Instant::now() - start > timeout {
-            return Err(WebDriverError::Timeout("Timeout waiting for element to be clickable".into()));
-        }
-        if let Ok(element) = driver.find(selector.clone()).await {
-            if element.is_displayed().await? && element.is_enabled().await? {
-                return Ok(());
-            }
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-async fn click_easy_apply_button(driver: &WebDriver) -> WebDriverResult<()> {
-    let timeout = Duration::from_secs(30);
-    let start = tokio::time::Instant::now();
-    loop {
-        if tokio::time::Instant::now() - start > timeout {
-            return Err(WebDriverError::Timeout("Timeout waiting for Easy apply button".into()));
-        }
-        if let Ok(main_element) = driver.find(By::Css("main.flex.flex-col")).await {
-            println!("Found main element");
-            let div_elements = main_element.find_all(By::Css("div")).await?;
-            for div in div_elements {
-                if let Ok(id) = div.attr("id").await {
-                    if let Some(id_value) = id {
-                        println!("Found div with id: {}", id_value);
-                        if id_value == "applyButton" {
-                            println!("Found applyButton div");
-                            let button_elements = div.find_all(By::Css("button")).await?;
-                            println!("Found {} button elements", button_elements.len());
-                            for button in button_elements {
-                                if let Ok(class) = button.attr("class").await {
-                                    if let Some(class_value) = class {
-                                        println!("Button class: {}", class_value);
-                                        if class_value.contains("btn btn-primary") {
-                                            if let Ok(text) = button.text().await {
-                                                if text == "Easy apply" {
-                                                    println!("Found Easy apply button");
-                                                    // Scroll the button into view
-                                                    button.scroll_into_view().await?;
-                                                    // Add a small delay to ensure the button is fully interactable
-                                                    sleep(Duration::from_millis(500)).await;
-                                                    button.click().await?;
-                                                    return Ok(());
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            // Stop the loop once we find the applyButton div
-                            break;
-                        }
-                    }
-                }
-            }
-        }
-        sleep(Duration::from_millis(500)).await;
-    }
-}
-
-
-
-// async fn open_job_urls(driver: &WebDriver, jobs: Vec<Job>) -> WebDriverResult<()> {
-//     for job in jobs {
-//         println!("Opening job URL: {}", job.url);
-//         driver.get(&job.url).await?;
-//         // Click the "Easy apply" button
-//         click_easy_apply_button(driver).await?;
-//         sleep(Duration::from_secs(2)).await; // Wait for 2 seconds before opening the next URL
-//     }
-//     Ok(())
-// }
-
-async fn get_element_attributes(driver: &WebDriver, element: &WebElement) -> WebDriverResult<HashMap<String, String>> {
-    let mut attributes = HashMap::new();
-    let script = r#"
-        var items = {};
-        for (index = 0; index < arguments[0].attributes.length; ++index) {
-            items[arguments[0].attributes[index].name] = arguments[0].attributes[index].value;
-        }
-        return items;
-    "#;
-    let element_id = element.element_id().to_string();
-    let result = driver.execute_script(script, vec![Value::String(element_id)]).await?;
-    let result_json: Value = serde_json::from_str(&result.json().to_string()).unwrap();
-    if let Some(map) = result_json.as_object() {
-        for (key, value) in map {
-            if let Some(value_str) = value.as_str() {
-                attributes.insert(key.clone(), value_str.to_string());
-            }
-        }
-    }
-    Ok(attributes)
-}
-
 fn generate_encoded_url(job_id: &str, job_title: &str, search_params: &str) -> String {
     let data = json!({
         "djvVersion": "new",
@@ -366,21 +263,83 @@ async fn open_job_urls(driver: &WebDriver, jobs: Vec<Job>, search_params: &str) 
         println!("Opening job URL: {}", job.url);
         let encoded_url = generate_encoded_url(&job.url, &job.job_title, search_params);
         println!("Navigating to encoded URL: {}", encoded_url);
+
+        // Load cookies from the file
+        load_cookies(driver).await?;
+
         driver.get(&encoded_url).await?;
-        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds before opening the next URL
+        sleep(Duration::from_secs(10)).await; // Wait for 10 seconds to ensure the page is fully loaded
 
         // Click the "Easy Apply" button using JavaScript
-        let script = r#"
+        let script_easy_apply = r#"
             var button = document.querySelector('button.btn.btn-primary');
             if (button && button.innerText === 'Easy apply') {
                 button.click();
             }
         "#;
-        driver.execute_script(script, vec![]).await?;
-        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds after clicking the button
+        driver.execute(script_easy_apply, vec![]).await?;
+        sleep(Duration::from_secs(10)).await; // Wait for 10 seconds to ensure the application page is fully loaded
+
+        // Wait for the "Next" button to be present and clickable
+        let script_wait_next_button = r#"
+            return new Promise((resolve) => {
+                const observer = new MutationObserver((mutations, obs) => {
+                    const nextButton = document.querySelector('button.seds-button-primary.btn-next');
+                    if (nextButton && nextButton.innerText === 'Next') {
+                        obs.disconnect();
+                        resolve(true);
+                    }
+                });
+                observer.observe(document, { childList: true, subtree: true });
+            });
+        "#;
+        driver.execute(script_wait_next_button, vec![]).await?;
+        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds to ensure the button is fully interactable
+
+        // Click the "Next" button using JavaScript
+        let script_next_button = r#"
+            var nextButton = document.querySelector('button.seds-button-primary.btn-next');
+            if (nextButton && nextButton.innerText === 'Next') {
+                nextButton.click();
+            }
+        "#;
+        driver.execute(script_next_button, vec![]).await?;
+        sleep(Duration::from_secs(10)).await; // Wait for 10 seconds to ensure the next page is fully loaded
+
+        // Wait for the "Submit" button to be present and clickable
+        let script_wait_submit_button = r#"
+            return new Promise((resolve) => {
+                const observer = new MutationObserver((mutations, obs) => {
+                    const submitButton = document.querySelector('button.seds-button-primary.btn-next');
+                    if (submitButton && submitButton.innerText === 'Submit') {
+                        obs.disconnect();
+                        resolve(true);
+                    }
+                });
+                observer.observe(document, { childList: true, subtree: true });
+            });
+        "#;
+        driver.execute(script_wait_submit_button, vec![]).await?;
+        sleep(Duration::from_secs(2)).await; // Wait for 2 seconds to ensure the button is fully interactable
+
+        // Click the "Submit" button using JavaScript
+        let script_submit_button = r#"
+            var submitButton = document.querySelector('button.seds-button-primary.btn-next');
+            if (submitButton && submitButton.innerText === 'Submit') {
+                submitButton.click();
+            }
+        "#;
+        driver.execute(script_submit_button, vec![]).await?;
+        sleep(Duration::from_secs(10)).await; // Wait for 10 seconds to ensure the application is submitted
+
+        // Wait for 2 seconds before opening the next URL
+        sleep(Duration::from_secs(2)).await;
     }
     Ok(())
 }
+
+
+
 
 #[tokio::main]
 async fn main() -> WebDriverResult<()> {
